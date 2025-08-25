@@ -11,7 +11,7 @@ import torch
 from torch.utils.data import Sampler
 
 from .datasets import ADE20K, CocoCaptions, ImageNet, ImageNet22k
-from .samplers import EpochSampler, InfiniteSampler, ShardedInfiniteSampler
+from .samplers import EpochSampler, InfiniteSampler, ShardedInfiniteSampler, BalancedSampler
 
 logger = logging.getLogger("dinov3")
 
@@ -22,6 +22,7 @@ class SamplerType(Enum):
     INFINITE = 2
     SHARDED_INFINITE = 3
     SHARDED_INFINITE_NEW = 4
+    BALANCED = 5
 
 
 def _make_bool_str(b: bool) -> str:
@@ -164,6 +165,17 @@ def _make_sampler(
             seed=seed,
             drop_last=False,
         )
+    elif type == SamplerType.BALANCED:
+        logger.info("sampler: balanced")
+        if advance > 0:
+            raise NotImplementedError("sampler advance > 0 is not supported for balanced sampler")
+        size = size if size > 0 else sample_count
+        logger.info(f"# of samples / epoch: {size:,d}")
+        return BalancedSampler(
+            dataset=dataset,
+            size=size,
+            seed=seed,
+        )
 
     logger.info("sampler: none")
     return None
@@ -195,7 +207,7 @@ def make_data_loader(
         num_workers: The number of workers to use.
         shuffle: Whether to shuffle samples.
         seed: The random seed to use.
-        sampler_type: Which sampler to use: EPOCH, INFINITE, SHARDED_INFINITE, SHARDED_INFINITE_NEW, DISTRIBUTED or None.
+        sampler_type: Which sampler to use: EPOCH, INFINITE, SHARDED_INFINITE, SHARDED_INFINITE_NEW, DISTRIBUTED, BALANCED or None.
         sampler_size: The number of images per epoch (when applicable) or -1 for the entire dataset.
         sampler_advance: How many samples to skip (when applicable).
         drop_last: Whether the last non-full batch of data should be dropped.
