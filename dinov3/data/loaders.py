@@ -10,7 +10,7 @@ from typing import Any, Callable, List, Optional, TypeVar
 import torch
 from torch.utils.data import Sampler
 
-from .datasets import ADE20K, CocoCaptions, ImageNet, ImageNet22k
+from .datasets import ADE20K, AffordanceADE, CocoCaptions, ImageNet, ImageNet22k
 from .samplers import EpochSampler, InfiniteSampler, ShardedInfiniteSampler, BalancedSampler
 
 logger = logging.getLogger("dinov3")
@@ -52,8 +52,29 @@ def _parse_dataset_str(dataset_str: str):
 
     for token in tokens[1:]:
         key, value = token.split("=")
-        assert key in ("root", "extra", "split")
-        kwargs[key] = value
+        assert key in ("root", "extra", "split", "affordance_type", "ade20k_root_dir", 
+                       "ade_affordance_root_dir", "preprocd_root_dir", "highlight_params")
+        
+        # Handle special parsing for certain parameters
+        if key == "highlight_params":
+            # Parse simple dict-like string format
+            # e.g., highlight_params=alpha:0,border_thickness:10
+            param_dict = {}
+            if value:
+                for param in value.split(","):
+                    if ":" in param:
+                        param_key, param_value = param.split(":", 1)
+                        # Try to convert to appropriate type
+                        try:
+                            param_dict[param_key] = int(param_value)
+                        except ValueError:
+                            try:
+                                param_dict[param_key] = float(param_value)
+                            except ValueError:
+                                param_dict[param_key] = param_value
+            kwargs[key] = param_dict if param_dict else None
+        else:
+            kwargs[key] = value
 
     if name == "ImageNet":
         class_ = ImageNet
@@ -65,6 +86,12 @@ def _parse_dataset_str(dataset_str: str):
         class_ = ADE20K
         if "split" in kwargs:
             kwargs["split"] = ADE20K.Split[kwargs["split"]]
+    elif name == "AffordanceADE":
+        class_ = AffordanceADE
+        if "split" in kwargs:
+            kwargs["split"] = AffordanceADE.Split[kwargs["split"]]
+        if "affordance_type" in kwargs:
+            kwargs["affordance_type"] = AffordanceADE.AffordanceType[kwargs["affordance_type"]]
     elif name == "CocoCaptions":
         class_ = CocoCaptions
         if "split" in kwargs:
@@ -86,6 +113,11 @@ def make_dataset(
 
     Args:
         dataset_str: A dataset string description (e.g. ImageNet:split=TRAIN).
+                     Supported formats:
+                     - ImageNet:split=TRAIN
+                     - ADE20K:split=TRAIN  
+                     - AffordanceADE:split=TRAIN:affordance_type=SIT:preprocd_root_dir=tsv
+                     - CocoCaptions:split=TRAIN
         transform: A transform to apply to images.
         target_transform: A transform to apply to targets.
 
