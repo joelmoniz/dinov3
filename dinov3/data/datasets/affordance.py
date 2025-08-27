@@ -129,7 +129,7 @@ class AffordanceADE(ExtendedVisionDataset):
             import os
             
             # Add the AffordanceADE directory to the path
-            affordance_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), '..', 'AffordanceADE')
+            affordance_path = os.path.join(__file__.split("dinov3")[0], 'AffordanceADE')
             if affordance_path not in sys.path:
                 sys.path.append(affordance_path)
             
