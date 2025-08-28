@@ -1,14 +1,123 @@
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-#
-# This software may be used and distributed in accordance with
-# the terms of the DINOv3 License Agreement.
-
 """
 AffordanceADE dataset for DINOv3.
 
 This dataset loads instances from ADE20K with affordance annotations and creates
 highlighted images for classification. Each sample contains a highlighted object
 and its affordance label (sit/run/grasp capability).
+
+# AffordanceADE Dataset README
+
+## Basic Usage
+
+### 1. Using the dataset string format
+
+```python
+from dinov3.data.loaders import make_dataset, make_data_loader, SamplerType
+
+# Create an AffordanceADE dataset
+dataset = make_dataset(
+    dataset_str="AffordanceADE:split=TRAIN:affordance_type=SIT:preprocd_root_dir=tsv"
+)
+
+# Create a data loader
+data_loader = make_data_loader(
+    dataset=dataset,
+    batch_size=32,
+    num_workers=4,
+    sampler_type=SamplerType.BALANCED,  # Recommended for imbalanced affordance data
+)
+```
+
+### 2. Direct instantiation
+
+```python
+from dinov3.data.datasets import AffordanceADE
+
+dataset = AffordanceADE(
+    split=AffordanceADE.Split.TRAIN,
+    affordance_type=AffordanceADE.AffordanceType.SIT,
+    preprocd_root_dir="tsv",
+    extra="cache"  # For caching processed data
+)
+```
+
+## Dataset String Parameters
+
+The AffordanceADE dataset supports the following parameters in dataset strings:
+
+- `split`: TRAIN, VAL, or TEST
+- `affordance_type`: SIT, RUN, or GRASP  
+- `root`: Root directory (compatibility)
+- `extra`: Extra directory for cached data
+- `preprocd_root_dir`: Path to preprocessed TSV files
+- `ade20k_root_dir`: Path to ADE20K dataset (alternative to preprocd_root_dir)
+- `ade_affordance_root_dir`: Path to ADE affordance annotations
+- `highlight_params`: Object highlighting parameters (format: `key1:value1,key2:value2`)
+
+### Examples:
+
+```python
+# Basic usage with preprocessed data
+"AffordanceADE:split=TRAIN:affordance_type=SIT:preprocd_root_dir=tsv"
+
+# With custom highlighting
+"AffordanceADE:split=VAL:affordance_type=RUN:preprocd_root_dir=tsv:highlight_params=alpha:0.3,border_thickness:5"
+
+# With caching
+"AffordanceADE:split=TEST:affordance_type=GRASP:preprocd_root_dir=tsv:extra=cache"
+
+# Using raw data sources
+"AffordanceADE:split=TRAIN:affordance_type=SIT:ade20k_root_dir=ADE20K:ade_affordance_root_dir=AffordanceADE"
+```
+
+## Recommended Sampler Types
+
+Due to the imbalanced nature of affordance data, these sampler types are recommended:
+
+1. **BALANCED**: Automatically handles class imbalance using weighted sampling
+2. **EPOCH**: For standard epoch-based training
+3. **INFINITE**: For continuous training without epoch boundaries
+
+```python
+# Balanced sampling (recommended)
+data_loader = make_data_loader(
+    dataset=dataset,
+    batch_size=32,
+    sampler_type=SamplerType.BALANCED,
+    sampler_size=1000,  # Number of samples per epoch
+)
+
+# Get sampling statistics
+if hasattr(data_loader.sampler, 'get_class_distribution_info'):
+    info = data_loader.sampler.get_class_distribution_info()
+    print(f"Class distribution: {info}")
+```
+
+## Dataset Statistics
+
+The AffordanceADE dataset provides rich statistics:
+
+```python
+stats = dataset.get_stats()
+print(f"Total samples: {stats['total_samples']}")
+print(f"Positive affordance ratio: {stats['positive_ratio']:.2f}")
+print(f"Class distribution: {stats['class_distribution']}")
+```
+
+## Integration Benefits
+
+1. **Seamless Integration**: Works with existing DINOv3 training scripts
+2. **Balanced Sampling**: Built-in support for handling class imbalance
+3. **Lazy Loading**: Efficient memory usage with on-demand data loading
+4. **Caching Support**: Compatible with DINOv3's extra file caching system
+5. **Transform Compatibility**: Works with DINOv3's transform pipeline
+
+## File Structure
+
+The AffordanceADE dataset is now located at:
+- `dinov3/dinov3/data/datasets/affordance.py` - Main dataset implementation
+- Added to `dinov3/dinov3/data/datasets/__init__.py` - Export
+- Integrated in `dinov3/dinov3/data/loaders.py` - Loader support
 """
 
 import os
