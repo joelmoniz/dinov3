@@ -7,7 +7,11 @@ from dataclasses import dataclass
 from typing import Tuple, TypedDict
 
 import torch
-import torch.backends.cudnn as cudnn
+try:
+    import torch.backends.cudnn as cudnn
+    cudnn_enabled = True
+except ImportError:
+    cudnn_enabled = False
 import torch.nn as nn
 
 from dinov3.configs import DinoV3SetupArgs, setup_config
@@ -33,14 +37,19 @@ class BaseModelContext(TypedDict):
 
 def load_model_and_context(model_config: ModelConfig, output_dir: str) -> tuple[torch.nn.Module, BaseModelContext]:
     if model_config.dino_hub is not None:
-        assert model_config.pretrained_weights is None and model_config.config_file is None
-        if "dinov3" in model_config.dino_hub:
-            repo = "dinov3"
-        elif "dinov2" in model_config.dino_hub:
-            repo = "dinov2"
+        assert model_config.config_file is None
+        if model_config.pretrained_weights is None:
+            if "dinov3" in model_config.dino_hub:
+                repo = "dinov3"
+            elif "dinov2" in model_config.dino_hub:
+                repo = "dinov2"
+            else:
+                raise ValueError
+            model = torch.hub.load(f"facebookresearch/{repo}", model_config.dino_hub)
         else:
-            raise ValueError
-        model = torch.hub.load(f"facebookresearch/{repo}", model_config.dino_hub)
+            # get current file path
+            dino_repo_path = __file__.split("dinov3")[0] + "dinov3"
+            model = torch.hub.load(dino_repo_path, model_config.dino_hub, source='local', weights=model_config.pretrained_weights)
         base_model_context = BaseModelContext(autocast_dtype=torch.float)
     else:
         model, base_model_context = setup_and_build_model(
@@ -49,7 +58,8 @@ def load_model_and_context(model_config: ModelConfig, output_dir: str) -> tuple[
             output_dir=output_dir,
         )
 
-    model.cuda()
+    if torch.cuda.is_available():
+        model.cuda()
     model.eval()
     return model, base_model_context
 
@@ -70,7 +80,8 @@ def setup_and_build_model(
     opts: list | None = None,
     **ignored_kwargs,
 ) -> Tuple[nn.Module, BaseModelContext]:
-    cudnn.benchmark = True
+    if cudnn_enabled and torch.cuda.is_available():
+        cudnn.benchmark = True
     del ignored_kwargs
     setup_args = DinoV3SetupArgs(
         config_file=config_file,

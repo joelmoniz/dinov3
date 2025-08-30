@@ -292,7 +292,7 @@ from dinov3.data.transforms import (
 from dinov3.eval.data import create_train_dataset_dict, get_num_classes, pad_multilabel_and_collate
 from dinov3.eval.helpers import args_dict_to_dataclass, cli_parser, write_results
 from dinov3.eval.metrics import ClassificationMetricType, build_classification_metric
-from dinov3.eval.setup import ModelConfig, load_model_and_context
+from dinov3.eval.setup import load_model_and_context
 from dinov3.eval.utils import LossType, ModelWithIntermediateLayers, average_metrics, evaluate
 from dinov3.eval.utils import save_results as default_save_results_func
 from dinov3.logging import MetricLogger, SmoothedValue
@@ -363,7 +363,7 @@ class TrainConfig:
 @dataclass
 class EvalConfig:
     test_datasets: Tuple[str, ...] = ()  # additional test dataset paths
-    test_metric_types: Tuple[ClassificationMetricType, ...] = ()
+    test_metric_types: Tuple[ClassificationMetricType, ...] = (ClassificationMetricType.MEAN_PER_CLASS_ACCURACY,)
     batch_size: int = 256  # batch size (per GPU)
     num_workers: int = 8
 
@@ -379,6 +379,19 @@ class FewShotConfig:
     enable: bool = False  # whether to use few-shot evaluation
     k_or_percent: Optional[float] = None  # number of elements or % to take per class
     n_tries: int = 1  # number of tries for few-shot evaluation
+
+
+@dataclass
+class ModelConfig:
+    """
+    Model configuration for linear evaluation.
+    Compatible with the original ModelConfig but with more flexible field requirements.
+    """
+    # Loading a local file
+    config_file: str | None = None
+    pretrained_weights: str | None = None
+    # Loading a DINOv3 or v2 model from torch.hub
+    dino_hub: str | None = None
 
 
 @dataclass
@@ -530,7 +543,7 @@ def make_eval_data_loader(
         dataset=DatasetWithEnumeratedTargets(test_dataset, pad_dataset=True, num_replicas=num_replicas),
         batch_size=batch_size,
         num_workers=num_workers,
-        sampler_type=SamplerType.DISTRIBUTED,
+        sampler_type=SamplerType.DISTRIBUTED if num_replicas > 1 else None,
         drop_last=False,
         shuffle=False,
         persistent_workers=False,
