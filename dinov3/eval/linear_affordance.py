@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
 """
+TL;DR: Run this as--
+python -m dinov3.eval.linear_affordance --model.dino_hub=dinov3_vits16 --model.pretrained_weights=/Users/joelmoniz/Downloads/dinov3_vits16_pretrain_lvd1689m-08c60483.pth --train.dataset="AffordanceADE:split=TRAIN:affordance_type=SIT:preprocd_root_dir=/Users/joelmoniz/code/sit/tsv/" --train.val_dataset="AffordanceADE:split=VAL:affordance_type=SIT:preprocd_root_dir=/Users/joelmoniz/code/sit/tsv/" --eval.test_datasets="[AffordanceADE:split=TEST:affordance_type=SIT:preprocd_root_dir=/Users/joelmoniz/code/sit/tsv/]" --output_dir=/Users/joelmoniz/code/sit/dino_out
+
 Linear evaluation for AffordanceADE dataset using DINOv3 features.
 
 This script performs linear classification on highlighted objects from the ADE20K dataset
