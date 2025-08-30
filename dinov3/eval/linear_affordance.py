@@ -6,6 +6,12 @@ This script performs linear classification on highlighted objects from the ADE20
 with affordance annotations (sit/run/grasp capabilities). It uses frozen DINOv3 features
 and trains linear classifiers on top.
 
+DEVICE COMPATIBILITY:
+This script automatically detects and works on both CPU and GPU:
+- GPU: CUDA will be used if available (recommended for performance)
+- CPU: Falls back to CPU computation if CUDA is not available
+- Distributed training is supported on GPU setups
+
 IMPORTANT SETUP REQUIREMENTS:
 1. Ensure you have the AffordanceADE dataset properly set up with:
    - ADE20K base dataset (images and annotations)
@@ -86,6 +92,8 @@ Notes:
 - The affordance dataset has 7 classes: [negative, exception1-5, positive]
 - Macro-averaging gives equal weight to each class regardless of frequency
 - Results are saved to results-linear-affordance.csv in the output directory
+- Automatically detects and uses GPU if available, falls back to CPU otherwise
+- For best performance, use GPU with CUDA support
 
 =============================
 
@@ -239,6 +247,32 @@ import torch.backends.cudnn as cudnn
 import torch.nn as nn
 from omegaconf import MISSING
 from torch.nn.parallel import DistributedDataParallel
+
+# Device detection for CPU/GPU compatibility
+def get_device():
+    """Get the appropriate device (cuda if available, otherwise cpu)."""
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+def to_device(tensor_or_module, device=None, non_blocking=False):
+    """Move tensor or module to the specified device."""
+    if device is None:
+        device = get_device()
+    if non_blocking and hasattr(tensor_or_module, 'to'):
+        return tensor_or_module.to(device, non_blocking=non_blocking)
+    else:
+        return tensor_or_module.to(device)
+
+def get_current_device():
+    """Get current device (cuda device or cpu)."""
+    if torch.cuda.is_available() and torch.cuda.current_device() >= 0:
+        return torch.cuda.current_device()
+    else:
+        return torch.device("cpu")
+
+def sync_device():
+    """Synchronize device (cuda sync if available, otherwise no-op)."""
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
 
 import dinov3.distributed as distributed
 from dinov3.checkpointer import (
@@ -429,10 +463,16 @@ class LinearPostprocessor(nn.Module):
 
 def scale_lr(learning_rates, batch_size):
     # Reduced scaling for affordance classification
-    return learning_rates * (batch_size * distributed.get_world_size()) / 512.0
+    # Handle both distributed and single-device scenarios
+    try:
+        world_size = distributed.get_world_size() if distributed.is_enabled() else 1
+    except:
+        world_size = 1
+    return learning_rates * (batch_size * world_size) / 512.0
 
 
 def setup_linear_classifiers(sample_output, n_last_blocks_list, learning_rates, batch_size, num_classes=7):
+    device = get_device()
     linear_classifiers_dict = nn.ModuleDict()
     optim_param_groups = []
     for n in n_last_blocks_list:
@@ -443,7 +483,7 @@ def setup_linear_classifiers(sample_output, n_last_blocks_list, learning_rates, 
                 linear_classifier = LinearClassifier(
                     out_dim, use_n_blocks=n, use_avgpool=avgpool, num_classes=num_classes
                 )
-                linear_classifier = linear_classifier.cuda()
+                linear_classifier = to_device(linear_classifier, device)
                 linear_classifiers_dict[
                     f"classifier_{n}_blocks_avgpool_{avgpool}_lr_{lr:.5f}".replace(".", "_")
                 ] = linear_classifier
@@ -480,8 +520,14 @@ def make_eval_data_loader(
     if hasattr(test_dataset, "get_imagenet_class_mapping"):
         class_mapping = test_dataset.get_imagenet_class_mapping()
 
+    # Handle distributed and single-device scenarios
+    try:
+        num_replicas = distributed.get_world_size() if distributed.is_enabled() else 1
+    except:
+        num_replicas = 1
+    
     test_data_loader = make_data_loader(
-        dataset=DatasetWithEnumeratedTargets(test_dataset, pad_dataset=True, num_replicas=distributed.get_world_size()),
+        dataset=DatasetWithEnumeratedTargets(test_dataset, pad_dataset=True, num_replicas=num_replicas),
         batch_size=batch_size,
         num_workers=num_workers,
         sampler_type=SamplerType.DISTRIBUTED,
@@ -540,7 +586,7 @@ class Evaluator:
             self.data_loader,
             postprocessors,
             metrics,
-            torch.cuda.current_device(),
+            get_current_device(),
             accumulate_results=accumulate_results,
         )
 
@@ -644,6 +690,7 @@ def setup_linear_training(
     training_num_classes: int,
     checkpoint_output_dir: str,
 ):
+    device = get_device()
     linear_classifiers, optim_param_groups = setup_linear_classifiers(
         sample_output,
         config.n_last_blocks_list,
@@ -666,7 +713,7 @@ def setup_linear_training(
         last_checkpoint_dir := find_latest_checkpoint(config.classifier_fpath or checkpoint_output_dir)
     ):
         logger.info(f"Checkpoint found {last_checkpoint_dir}")
-        checkpoint = torch.load(last_checkpoint_dir / "checkpoint.pth")
+        checkpoint = torch.load(last_checkpoint_dir / "checkpoint.pth", map_location=device)
         start_iter = checkpoint.get("iteration", -1) + 1
         best_accuracy = checkpoint.get("best_accuracy", -1)
         linear_classifiers.load_state_dict(checkpoint["linear_classifiers"])
@@ -698,9 +745,10 @@ def train_linear_classifiers(
     val_evaluator: Evaluator,
     checkpoint_output_dir: str,
 ):
+    device = get_device()
     (linear_classifiers, start_iter, max_iter, criterion, optimizer, scheduler, best_accuracy,) = setup_linear_training(
         config=train_config,
-        sample_output=feature_model(train_dataset[0][0].unsqueeze(0).cuda()),
+        sample_output=feature_model(to_device(train_dataset[0][0].unsqueeze(0), device)),
         training_num_classes=training_num_classes,
         checkpoint_output_dir=checkpoint_output_dir,
     )
@@ -732,8 +780,8 @@ def train_linear_classifiers(
         max_iter,
         start_iter,
     ):
-        data = data.cuda(non_blocking=True)
-        labels = labels.cuda(non_blocking=True)
+        data = to_device(data, device, non_blocking=True)
+        labels = to_device(labels, device, non_blocking=True)
 
         features = feature_model(data)
         outputs = linear_classifiers(features)
@@ -753,7 +801,7 @@ def train_linear_classifiers(
 
         # log
         if iteration % 10 == 0:
-            torch.cuda.synchronize()
+            sync_device()
             metric_logger.update(loss=loss.item())
             metric_logger.update(lr=optimizer.param_groups[0]["lr"])
 
@@ -792,7 +840,9 @@ def train_linear_classifiers(
                     "best_accuracy": best_accuracy,
                 }
                 torch.save(checkpoint, ckpt_dir / "best" / "checkpoint.pth")
-            torch.distributed.barrier()
+            # Only barrier if distributed is enabled
+            if distributed.is_enabled():
+                torch.distributed.barrier()
 
         iteration = iteration + 1
 
@@ -811,11 +861,16 @@ def make_train_dataset(train_dataset: str, transform_config: TransformConfig):
 
 def eval_linear_with_model(*, model: torch.nn.Module, autocast_dtype, config: LinearAffordanceEvalConfig):
     start = time.time()
-    cudnn.benchmark = True
+    device = get_device()
+    
+    # Only set cudnn benchmark if using CUDA
+    if device.type == "cuda":
+        cudnn.benchmark = True
 
     train_dataset = make_train_dataset(config.train.dataset, config.transform)
     training_num_classes = get_num_classes(train_dataset)
     logger.info(f"AffordanceADE dataset has {training_num_classes} classes")
+    logger.info(f"Using device: {device}")
     
     train_dataset_dict = create_train_dataset_dict(
         train_dataset,
@@ -824,7 +879,14 @@ def eval_linear_with_model(*, model: torch.nn.Module, autocast_dtype, config: Li
         few_shot_n_tries=config.few_shot.n_tries,
     )
     n_last_blocks = max(config.train.n_last_blocks_list)
-    autocast_ctx = partial(torch.autocast, device_type="cuda", enabled=True, dtype=autocast_dtype)
+    
+    # Set up autocast context based on device type
+    if device.type == "cuda":
+        autocast_ctx = partial(torch.autocast, device_type="cuda", enabled=True, dtype=autocast_dtype)
+    else:
+        # For CPU, we can use autocast but it's less critical
+        autocast_ctx = partial(torch.autocast, device_type="cpu", enabled=True)
+    
     feature_model = ModelWithIntermediateLayers(model, n_last_blocks, autocast_ctx)
 
     save_results_func = None
@@ -906,8 +968,26 @@ def main(argv=None):
     if argv is None:
         argv = sys.argv[1:]
     eval_args = cli_parser(argv)
-    with job_context(output_dir=eval_args["output_dir"]):
-        benchmark_launcher(eval_args=eval_args)
+    
+    # Fix CLI argument keys by removing '--' prefixes
+    # OmegaConf.from_cli creates keys with '--' prefixes that don't match our dataclass fields
+    processed_args = {}
+    for key, value in eval_args.items():
+        if key.startswith('--'):
+            # Remove the '--' prefix to match dataclass field names
+            clean_key = key[2:].replace('-', '_')  # Also convert dashes to underscores
+            processed_args[clean_key] = value
+        else:
+            processed_args[key] = value
+    
+    # Determine if distributed training should be enabled
+    # Enable distributed only if CUDA is available and multiple GPUs are detected
+    # This ensures CPU-only setups and single-GPU setups work correctly
+    device = get_device()
+    distributed_enabled = device.type == "cuda" and torch.cuda.device_count() > 1
+    
+    with job_context(distributed_enabled=distributed_enabled, output_dir=processed_args["output_dir"]):
+        benchmark_launcher(processed_args)
     return 0
 
 
