@@ -79,6 +79,18 @@ Usage Examples:
      --few_shot.n_tries=3 \
      --output_dir=/path/to/output
 
+5. With Weights & Biases logging:
+   python -m dinov3.eval.linear_affordance \
+     --model.type=vit_large \
+     --model.path=/path/to/dinov3_vitl14_pretrain.pth \
+     --train.dataset="AffordanceADE:split=TRAIN:affordance_type=SIT:ade20k_root_dir=/path/to/ade20k:ade_affordance_root_dir=/path/to/affordance" \
+     --train.val_dataset="AffordanceADE:split=VAL:affordance_type=SIT:ade20k_root_dir=/path/to/ade20k:ade_affordance_root_dir=/path/to/affordance" \
+     --wandb.enabled=true \
+     --wandb.entity=your_entity \
+     --wandb.project=dinov3-affordance \
+     --wandb.name=sit_vitl14_experiment \
+     --output_dir=/path/to/output
+
 Key Parameters:
 - model.type: Model architecture (vit_small, vit_base, vit_large, vit_giant2)
 - model.path: Path to pretrained DINOv3 checkpoint
@@ -88,6 +100,10 @@ Key Parameters:
 - train.batch_size: Training batch size per GPU (default: 128)
 - train.epochs: Number of training epochs (default: 10) 
 - transform.crop_size: Input image crop size (default: 224)
+- wandb.enabled: Enable Weights & Biases logging (default: true)
+- wandb.entity: W&B entity/team name (optional)
+- wandb.project: W&B project name (default: dinov3-affordance-linear)
+- wandb.name: Experiment name (auto-generated if not provided)
 - output_dir: Directory to save results and checkpoints
 
 Notes:
@@ -203,6 +219,25 @@ The dataset string format is: `AffordanceADE:split=SPLIT:affordance_type=TYPE:ad
 - `--few_shot.k_or_percent`: Number of elements or percentage per class
 - `--few_shot.n_tries`: Number of few-shot trials
 
+### Weights & Biases Parameters
+
+- `--wandb.enabled`: Enable W&B logging (default: true)
+- `--wandb.entity`: W&B entity/team name (optional)
+- `--wandb.project`: W&B project name (default: dinov3-affordance-linear)
+- `--wandb.name`: Experiment name (auto-generated if not provided)
+- `--wandb.tags`: Experiment tags as comma-separated list
+- `--wandb.notes`: Experiment description/notes
+- `--wandb.resume`: Resume policy ("allow", "must", "never", "auto")
+
+The wandb integration logs:
+- Training metrics: loss, learning rate, iteration, epoch
+- Validation metrics: accuracy, best classifier performance
+- Test metrics: final evaluation results on test datasets
+- Configuration: all hyperparameters and model settings
+- System info: device type, number of GPUs, distributed training status
+- Dataset info: number of classes, dataset sizes
+- Final summary: best accuracy, total training time, etc.
+
 ## Key Differences from Standard Linear Evaluation
 
 1. **Metric**: Uses `MEAN_PER_CLASS_ACCURACY` instead of `MEAN_ACCURACY` to handle class imbalance
@@ -229,6 +264,8 @@ See `examples/affordance_linear_example.py` for more detailed usage examples and
 - Macro-averaging ensures equal importance for all affordance classes regardless of their frequency
 - The system supports distributed training across multiple GPUs
 - Checkpointing allows resuming interrupted training runs
+- Weights & Biases logging is enabled by default and provides comprehensive experiment tracking
+- For best performance, use GPU with CUDA support
 
 
 
@@ -248,6 +285,7 @@ from typing import Any, Callable, Dict, Optional, Tuple
 import torch
 import torch.backends.cudnn as cudnn
 import torch.nn as nn
+import wandb
 from omegaconf import MISSING
 from torch.nn.parallel import DistributedDataParallel
 
@@ -398,12 +436,25 @@ class ModelConfig:
 
 
 @dataclass
+class WandbConfig:
+    """Configuration for Weights & Biases logging."""
+    enabled: bool = True  # whether to use wandb logging
+    entity: str | None = None  # wandb entity/team name
+    project: str = "dinov3-affordance-linear"  # wandb project name
+    name: str | None = None  # experiment name (auto-generated if None)
+    tags: Tuple[str, ...] = ()  # experiment tags
+    notes: str | None = None  # experiment notes
+    resume: str = "allow"  # resume policy: "allow", "must", "never", "auto"
+
+
+@dataclass
 class LinearAffordanceEvalConfig:
     model: ModelConfig
     train: TrainConfig = field(default_factory=TrainConfig)
     eval: EvalConfig = field(default_factory=EvalConfig)
     transform: TransformConfig = field(default_factory=TransformConfig)
     few_shot: FewShotConfig = field(default_factory=FewShotConfig)
+    wandb: WandbConfig = field(default_factory=WandbConfig)
     save_results: bool = False  # save predictions and targets in the output directory
     output_dir: str = ""
 
@@ -643,6 +694,7 @@ class Evaluator:
         best_classifier_on_val: Optional[Any] = None,
         save_filename_suffix: str = "",
         prefixstring: str = "",
+        use_wandb: bool = False,
     ):
         logger.info(f"Testing affordance classification on {self.dataset_str}")
         save_results = self.save_results_func is not None
@@ -663,6 +715,37 @@ class Evaluator:
             self.main_metric_name: 100.0 * full_results_dict["best_classifier"]["accuracy"],
             "best_classifier": full_results_dict["best_classifier"]["name"],
         }
+        
+        # Log evaluation metrics to wandb
+        if use_wandb and distributed.is_main_process():
+            # Extract dataset type from dataset string (val, test, etc.)
+            dataset_parts = self.dataset_str.split(":")
+            dataset_name = dataset_parts[0] if dataset_parts else self.dataset_str
+            split_type = "unknown"
+            for part in dataset_parts:
+                if "split=" in part:
+                    split_type = part.split("=")[1].lower()
+                    break
+            
+            affordance_type = "unknown"
+            for part in dataset_parts:
+                if "affordance_type=" in part:
+                    affordance_type = part.split("=")[1].lower()
+                    break
+            
+            # Log the main accuracy metric
+            wandb.log({
+                f"eval/{split_type}/{affordance_type}_accuracy": results_dict[self.main_metric_name],
+                f"eval/{split_type}/best_classifier": results_dict["best_classifier"],
+                "train/iteration": iteration,
+            }, step=iteration)
+            
+            # Also log overall accuracy if this is validation
+            if "val" in split_type.lower():
+                wandb.log({
+                    f"val/accuracy": results_dict[self.main_metric_name],
+                }, step=iteration)
+        
         return results_dict
 
 
@@ -760,6 +843,7 @@ def train_linear_classifiers(
     training_num_classes: int,
     val_evaluator: Evaluator,
     checkpoint_output_dir: str,
+    use_wandb: bool = False,
 ):
     device = get_device()
     (linear_classifiers, start_iter, max_iter, criterion, optimizer, scheduler, best_accuracy,) = setup_linear_training(
@@ -820,6 +904,15 @@ def train_linear_classifiers(
             sync_device()
             metric_logger.update(loss=loss.item())
             metric_logger.update(lr=optimizer.param_groups[0]["lr"])
+            
+            # Log to wandb if enabled
+            if use_wandb and distributed.is_main_process():
+                wandb.log({
+                    "train/loss": loss.item(),
+                    "train/learning_rate": optimizer.param_groups[0]["lr"],
+                    "train/iteration": iteration,
+                    "train/epoch": iteration / train_config.epoch_length,
+                }, step=iteration)
 
         # Checkpointing
         is_last_iteration = (iteration + 1) == max_iter
@@ -844,6 +937,7 @@ def train_linear_classifiers(
                 linear_classifiers=linear_classifiers,
                 prefixstring=f"ITER: {iteration}",
                 iteration=iteration,
+                use_wandb=use_wandb,
             )
             val_accuracy = val_results_dict[val_evaluator.main_metric_name]
             if val_accuracy >= best_accuracy:
@@ -856,6 +950,14 @@ def train_linear_classifiers(
                     "best_accuracy": best_accuracy,
                 }
                 torch.save(checkpoint, ckpt_dir / "best" / "checkpoint.pth")
+                
+                # Log best accuracy to wandb
+                if use_wandb and distributed.is_main_process():
+                    wandb.log({
+                        "val/best_accuracy": best_accuracy,
+                        "train/iteration_at_best": iteration,
+                    }, step=iteration)
+            
             # Only barrier if distributed is enabled
             if distributed.is_enabled():
                 torch.distributed.barrier()
@@ -879,6 +981,73 @@ def eval_linear_with_model(*, model: torch.nn.Module, autocast_dtype, config: Li
     start = time.time()
     device = get_device()
     
+    # Initialize wandb if enabled
+    use_wandb = config.wandb.enabled and distributed.is_main_process()
+    if use_wandb:
+        # Generate experiment name if not provided
+        run_name = config.wandb.name
+        if run_name is None:
+            # Extract key info from dataset and model config for auto-naming
+            try:
+                dataset_parts = config.train.dataset.split(":")
+                affordance_type = "unknown"
+                for part in dataset_parts:
+                    if "affordance_type=" in part:
+                        affordance_type = part.split("=")[1].lower()
+                        break
+                model_info = config.model.dino_hub or "custom"
+                run_name = f"linear_{affordance_type}_{model_info}"
+            except:
+                run_name = "linear_affordance_eval"
+        
+        # Initialize wandb
+        wandb.init(
+            entity=config.wandb.entity,
+            project=config.wandb.project,
+            name=run_name,
+            tags=list(config.wandb.tags),
+            notes=config.wandb.notes,
+            resume=config.wandb.resume,
+            config={
+                # Model configuration
+                "model_type": config.model.dino_hub or "custom",
+                "model_pretrained_weights": config.model.pretrained_weights,
+                "model_config_file": config.model.config_file,
+                
+                # Training configuration
+                "train_dataset": config.train.dataset,
+                "val_dataset": config.train.val_dataset,
+                "batch_size": config.train.batch_size,
+                "learning_rates": list(config.train.learning_rates),
+                "n_last_blocks_list": list(config.train.n_last_blocks_list),
+                "epochs": config.train.epochs,
+                "epoch_length": config.train.epoch_length,
+                "optimizer_type": config.train.optimizer_type.value,
+                "scheduler_type": config.train.scheduler_type.value,
+                "loss_type": config.train.loss_type.value,
+                "val_metric_type": config.train.val_metric_type.value,
+                
+                # Transform configuration
+                "crop_size": config.transform.crop_size,
+                "resize_size": config.transform.resize_size,
+                
+                # Evaluation configuration
+                "test_datasets": list(config.eval.test_datasets),
+                "eval_batch_size": config.eval.batch_size,
+                
+                # Few-shot configuration
+                "few_shot_enabled": config.few_shot.enable,
+                "few_shot_k_or_percent": config.few_shot.k_or_percent,
+                "few_shot_n_tries": config.few_shot.n_tries,
+                
+                # System information
+                "device": str(device),
+                "num_gpus": torch.cuda.device_count() if torch.cuda.is_available() else 0,
+                "distributed": distributed.is_enabled(),
+            }
+        )
+        logger.info(f"Initialized wandb run: {wandb.run.name}")
+    
     # Only set cudnn benchmark if using CUDA
     if device.type == "cuda":
         cudnn.benchmark = True
@@ -887,6 +1056,13 @@ def eval_linear_with_model(*, model: torch.nn.Module, autocast_dtype, config: Li
     training_num_classes = get_num_classes(train_dataset)
     logger.info(f"AffordanceADE dataset has {training_num_classes} classes")
     logger.info(f"Using device: {device}")
+    
+    # Log dataset information to wandb
+    if use_wandb:
+        wandb.log({
+            "dataset/num_classes": training_num_classes,
+            "dataset/train_size": len(train_dataset),
+        })
     
     train_dataset_dict = create_train_dataset_dict(
         train_dataset,
@@ -937,6 +1113,7 @@ def eval_linear_with_model(*, model: torch.nn.Module, autocast_dtype, config: Li
             training_num_classes=training_num_classes,
             val_evaluator=val_evaluator,
             checkpoint_output_dir=checkpoint_output_dir,
+            use_wandb=use_wandb,
         )
         checkpoint_output_dirs.append(checkpoint_output_dir)
         results_dict[_try] = val_evaluator.evaluate_and_maybe_save(
@@ -944,6 +1121,7 @@ def eval_linear_with_model(*, model: torch.nn.Module, autocast_dtype, config: Li
             linear_classifiers=linear_classifiers,
             iteration=iteration,
             save_filename_suffix=save_filename_suffix,
+            use_wandb=use_wandb,
         )
         for test_evaluator in test_evaluators:
             eval_results_dict = test_evaluator.evaluate_and_maybe_save(
@@ -952,6 +1130,7 @@ def eval_linear_with_model(*, model: torch.nn.Module, autocast_dtype, config: Li
                 iteration=iteration,
                 best_classifier_on_val=results_dict[_try]["best_classifier"],
                 save_filename_suffix=save_filename_suffix,
+                use_wandb=use_wandb,
             )
             results_dict[_try] = {**eval_results_dict, **results_dict[_try]}
 
@@ -963,6 +1142,30 @@ def eval_linear_with_model(*, model: torch.nn.Module, autocast_dtype, config: Li
     for checkpoint_output_dir in checkpoint_output_dirs:
         if distributed.is_subgroup_main_process():
             cleanup_checkpoint(checkpoint_output_dir, config.train.checkpoint_retention_policy)
+
+    # Log final results to wandb
+    if use_wandb:
+        final_results = {}
+        for key, value in results_dict.items():
+            if isinstance(value, (int, float)):
+                # Clean up key names for better wandb organization
+                if "per_class_accuracy" in key:
+                    clean_key = key.replace("_per_class_accuracy", "").replace(":", "_")
+                    final_results[f"final/{clean_key}_accuracy"] = value
+                elif "best_classifier" not in key:  # Skip non-numeric classifier names
+                    final_results[f"final/{key}"] = value
+        
+        wandb.log(final_results)
+        
+        # Create a summary table
+        wandb.summary.update({
+            "final_validation_accuracy": results_dict.get(val_evaluator.main_metric_name, 0),
+            "best_classifier_name": results_dict.get("best_classifier", "unknown"),
+            "total_training_time_seconds": int(time.time() - start),
+            "training_iterations": iteration,
+        })
+        
+        logger.info(f"Wandb run completed: {wandb.run.url}")
 
     logger.info("Affordance Test Results Dict " + str(results_dict))
     logger.info(f"Affordance linear evaluation done in {int(time.time() - start)}s")
