@@ -872,6 +872,7 @@ def train_linear_classifiers(
     logger.info("Starting affordance linear training from iteration {}".format(start_iter))
     metric_logger = MetricLogger(delimiter="  ")
     metric_logger.add_meter("lr", SmoothedValue(window_size=1, fmt="{value:.6g}"))
+    metric_logger.add_meter("acc", SmoothedValue(window_size=1, fmt="{value:.3f}"))
     header = "Affordance Training"
     for data, labels in metric_logger.log_every(
         train_data_loader,
@@ -905,14 +906,40 @@ def train_linear_classifiers(
             metric_logger.update(loss=loss.item())
             metric_logger.update(lr=optimizer.param_groups[0]["lr"])
             
+            # Calculate train accuracy for logging
+            train_accuracy = None
+            if use_wandb and distributed.is_main_process():
+                with torch.no_grad():
+                    # Get predictions from all classifiers and compute accuracy
+                    total_correct = 0
+                    total_samples = 0
+                    for classifier_name, output in outputs.items():
+                        if len(labels.shape) == 1:  # Classification labels
+                            predictions = torch.argmax(output, dim=1)
+                            correct = (predictions == labels).sum().item()
+                        else:  # Multi-label case
+                            predictions = (torch.sigmoid(output) > 0.5).float()
+                            correct = (predictions == labels).all(dim=1).sum().item()
+                        
+                        total_correct += correct
+                        total_samples += labels.size(0)
+                    
+                    # Average accuracy across all classifiers
+                    train_accuracy = (total_correct / total_samples) / len(outputs) if total_samples > 0 else 0.0
+                    metric_logger.update(acc=train_accuracy)
+            
             # Log to wandb if enabled
             if use_wandb and distributed.is_main_process():
-                wandb.log({
+                log_dict = {
                     "train/loss": loss.item(),
                     "train/learning_rate": optimizer.param_groups[0]["lr"],
                     "train/iteration": iteration,
                     "train/epoch": iteration / train_config.epoch_length,
-                }, step=iteration)
+                }
+                if train_accuracy is not None:
+                    log_dict["train/accuracy"] = train_accuracy * 100.0  # Convert to percentage
+                
+                wandb.log(log_dict, step=iteration)
 
         # Checkpointing
         is_last_iteration = (iteration + 1) == max_iter
