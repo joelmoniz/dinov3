@@ -333,7 +333,7 @@ from dinov3.data.transforms import (
 from dinov3.eval.data import create_train_dataset_dict, get_num_classes, pad_multilabel_and_collate
 from dinov3.eval.helpers import args_dict_to_dataclass, cli_parser, write_results
 from dinov3.eval.metrics import ClassificationMetricType, build_classification_metric
-from dinov3.eval.setup import load_model_and_context
+from dinov3.eval.setup import ModelConfig, load_model_and_context
 from dinov3.eval.utils import LossType, ModelWithIntermediateLayers, average_metrics, evaluate
 from dinov3.eval.utils import save_results as default_save_results_func
 from dinov3.logging import MetricLogger, SmoothedValue
@@ -492,8 +492,7 @@ class LinearClassifier(nn.Module):
         self.use_avgpool = use_avgpool
         self.num_classes = num_classes
         self.linear = nn.Linear(out_dim, num_classes)
-        # Initialize with smaller variance for affordance classification
-        self.linear.weight.data.normal_(mean=0.0, std=0.005)
+        self.linear.weight.data.normal_(mean=0.0, std=0.01)
         self.linear.bias.data.zero_()
 
     def forward(self, x_tokens_list):
@@ -529,13 +528,12 @@ class LinearPostprocessor(nn.Module):
 
 
 def scale_lr(learning_rates, batch_size):
-    # Reduced scaling for affordance classification
     # Handle both distributed and single-device scenarios
     try:
         world_size = distributed.get_world_size() if distributed.is_enabled() else 1
     except:
         world_size = 1
-    return learning_rates * (batch_size * world_size) / 512.0
+    return learning_rates * (batch_size * world_size) / 256.0
 
 
 def setup_linear_classifiers(sample_output, n_last_blocks_list, learning_rates, batch_size, num_classes=7):
