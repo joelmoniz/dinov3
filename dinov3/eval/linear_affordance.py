@@ -9,6 +9,15 @@ This script performs linear classification on highlighted objects from the ADE20
 with affordance annotations (sit/run/grasp capabilities). It uses frozen DINOv3 features
 and trains linear classifiers on top.
 
+EMBEDDING CACHING:
+This script now includes automatic embedding caching functionality:
+- On first run, DINOv3 embeddings are extracted from all datasets and cached to disk
+- Subsequent runs automatically detect and load cached embeddings, skipping feature extraction
+- Caching is based on dataset configuration, model type, and transform parameters
+- Cache files are stored in {output_dir}/embedding_cache/
+- Significantly speeds up training and evaluation after the initial embedding extraction
+- To disable caching, use --cache_embeddings=false
+
 DEVICE COMPATIBILITY:
 This script automatically detects and works on both CPU and GPU:
 - GPU: CUDA will be used if available (recommended for performance)
@@ -105,6 +114,7 @@ Key Parameters:
 - wandb.project: W&B project name (default: dinov3-affordance-linear)
 - wandb.name: Experiment name (auto-generated if not provided)
 - output_dir: Directory to save results and checkpoints
+- cache_embeddings: Enable DINOv3 embedding caching (default: true)
 
 Notes:
 - This script uses MEAN_PER_CLASS_ACCURACY (macro-averaged accuracy) as the primary metric
@@ -113,6 +123,7 @@ Notes:
 - Results are saved to results-linear-affordance.csv in the output directory
 - Automatically detects and uses GPU if available, falls back to CPU otherwise
 - For best performance, use GPU with CUDA support
+- Embedding caching significantly speeds up repeated runs with the same datasets and model
 
 =============================
 
@@ -274,6 +285,7 @@ See `examples/affordance_linear_example.py` for more detailed usage examples and
 import json
 import logging
 import os
+import pickle
 import sys
 import time
 from dataclasses import dataclass, field
@@ -281,6 +293,7 @@ from enum import Enum
 from functools import partial
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional, Tuple
+import hashlib
 
 import torch
 import torch.backends.cudnn as cudnn
@@ -314,6 +327,110 @@ def sync_device():
     """Synchronize device (cuda sync if available, otherwise no-op)."""
     if torch.cuda.is_available():
         torch.cuda.synchronize()
+
+
+# Embedding caching functionality
+def get_cache_key(dataset_str: str, model_config: 'ModelConfig', transform_config: 'TransformConfig') -> str:
+    """Generate a unique cache key based on dataset, model, and transform configurations."""
+    # Create a hash of the key components
+    key_components = {
+        'dataset_str': dataset_str,
+        'model_dino_hub': model_config.dino_hub,
+        'model_pretrained_weights': model_config.pretrained_weights,
+        'model_config_file': model_config.config_file,
+        'transform_crop_size': transform_config.crop_size,
+        'transform_resize_size': transform_config.resize_size,
+    }
+    
+    # Convert to string and hash
+    key_str = json.dumps(key_components, sort_keys=True)
+    cache_key = hashlib.md5(key_str.encode()).hexdigest()
+    return cache_key
+
+
+def get_cache_path(output_dir: str, cache_key: str, split_name: str) -> Path:
+    """Get the cache file path for embeddings."""
+    cache_dir = Path(output_dir) / "embedding_cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    return cache_dir / f"embeddings_{split_name}_{cache_key}.pkl"
+
+
+def save_embeddings_to_cache(embeddings_dict: Dict, cache_path: Path):
+    """Save embeddings dictionary to cache file."""
+    logger.info(f"Saving embeddings to cache: {cache_path}")
+    with open(cache_path, 'wb') as f:
+        pickle.dump(embeddings_dict, f)
+    logger.info(f"Embeddings cached successfully")
+
+
+def load_embeddings_from_cache(cache_path: Path) -> Optional[Dict]:
+    """Load embeddings dictionary from cache file."""
+    if not cache_path.exists():
+        return None
+    
+    try:
+        logger.info(f"Loading embeddings from cache: {cache_path}")
+        with open(cache_path, 'rb') as f:
+            embeddings_dict = pickle.load(f)
+        logger.info(f"Embeddings loaded from cache successfully")
+        return embeddings_dict
+    except Exception as e:
+        logger.warning(f"Failed to load embeddings from cache: {e}")
+        return None
+
+
+def extract_and_cache_embeddings(
+    feature_model: nn.Module,
+    data_loader,
+    cache_path: Path,
+    device
+) -> Dict[int, torch.Tensor]:
+    """Extract embeddings from the feature model and cache them."""
+    logger.info("Extracting embeddings from dataset...")
+    
+    embeddings_dict = {}
+    feature_model.eval()
+    
+    with torch.no_grad():
+        for batch_idx, (data, targets, indices) in enumerate(data_loader):
+            if batch_idx % 100 == 0:
+                logger.info(f"Processing batch {batch_idx}/{len(data_loader)}")
+            
+            data = to_device(data, device, non_blocking=True)
+            
+            # Extract features
+            features = feature_model(data)
+            
+            # Store embeddings with their indices
+            for i, idx in enumerate(indices):
+                embeddings_dict[idx.item()] = features[i].cpu()
+    
+    # Save to cache
+    save_embeddings_to_cache(embeddings_dict, cache_path)
+    return embeddings_dict
+
+
+class CachedDataset(torch.utils.data.Dataset):
+    """Dataset wrapper that uses cached embeddings instead of running feature extraction."""
+    
+    def __init__(self, original_dataset, embeddings_dict: Dict[int, torch.Tensor]):
+        self.original_dataset = original_dataset
+        self.embeddings_dict = embeddings_dict
+        
+    def __len__(self):
+        return len(self.original_dataset)
+    
+    def __getitem__(self, idx):
+        # Get the original item (for target/label)
+        _, target = self.original_dataset[idx]
+        
+        # Get cached embedding
+        if idx in self.embeddings_dict:
+            embedding = self.embeddings_dict[idx]
+        else:
+            raise KeyError(f"Embedding for index {idx} not found in cache")
+            
+        return embedding, target
 
 import dinov3.distributed as distributed
 from dinov3.checkpointer import (
@@ -456,6 +573,7 @@ class LinearAffordanceEvalConfig:
     wandb: WandbConfig = field(default_factory=WandbConfig)
     save_results: bool = False  # save predictions and targets in the output directory
     output_dir: str = ""
+    cache_embeddings: bool = True  # whether to cache DINOv3 embeddings
 
 
 def has_ddp_wrapper(m: nn.Module) -> bool:
@@ -576,6 +694,7 @@ def make_eval_data_loader(
     batch_size,
     num_workers,
     metric_type,
+    use_enumerated_targets=False,
 ):
     transform = make_eval_transform(transform_config)
     test_dataset = make_dataset(dataset_str=test_dataset_str, transform=transform)
@@ -590,8 +709,14 @@ def make_eval_data_loader(
     except:
         num_replicas = 1
     
+    # Use enumerated targets for caching if requested
+    if use_enumerated_targets:
+        dataset_with_enum = DatasetWithEnumeratedTargets(test_dataset, pad_dataset=True, num_replicas=num_replicas)
+    else:
+        dataset_with_enum = DatasetWithEnumeratedTargets(test_dataset, pad_dataset=True, num_replicas=num_replicas)
+    
     test_data_loader = make_data_loader(
-        dataset=DatasetWithEnumeratedTargets(test_dataset, pad_dataset=True, num_replicas=num_replicas),
+        dataset=dataset_with_enum,
         batch_size=batch_size,
         num_workers=num_workers,
         sampler_type=SamplerType.DISTRIBUTED if num_replicas > 1 else None,
@@ -613,17 +738,55 @@ class Evaluator:
     metrics_file_path: str
     training_num_classes: int
     save_results_func: Optional[Callable]
+    use_cached_embeddings: bool = False
+    cached_embeddings: Optional[Dict[int, torch.Tensor]] = None
 
     def __post_init__(self):
-        self.data_loader, self.class_mapping = make_eval_data_loader(
-            test_dataset_str=self.dataset_str,
-            batch_size=self.batch_size,
-            num_workers=self.num_workers,
-            transform_config=self.transform_config,
-            metric_type=self.metric_type,
-        )
+        # Only create data loader if not using cached embeddings
+        if not self.use_cached_embeddings:
+            self.data_loader, self.class_mapping = make_eval_data_loader(
+                test_dataset_str=self.dataset_str,
+                batch_size=self.batch_size,
+                num_workers=self.num_workers,
+                transform_config=self.transform_config,
+                metric_type=self.metric_type,
+                use_enumerated_targets=True,  # Always use enumerated for potential caching
+            )
+        else:
+            self.class_mapping = None
+            # Create a dummy data loader for cached embeddings
+            self._create_cached_data_loader()
+        
         # Use per-class accuracy as main metric name
         self.main_metric_name = f"{self.dataset_str}_per_class_accuracy"
+    
+    def _create_cached_data_loader(self):
+        """Create a data loader using cached embeddings."""
+        if self.cached_embeddings is None:
+            raise ValueError("Cached embeddings not provided")
+        
+        # Create the original dataset to get targets
+        transform = make_eval_transform(self.transform_config)
+        original_dataset = make_dataset(dataset_str=self.dataset_str, transform=transform)
+        
+        # Create cached dataset
+        cached_dataset = CachedDataset(original_dataset, self.cached_embeddings)
+        
+        # Handle distributed and single-device scenarios
+        try:
+            num_replicas = distributed.get_world_size() if distributed.is_enabled() else 1
+        except:
+            num_replicas = 1
+        
+        self.data_loader = make_data_loader(
+            dataset=cached_dataset,
+            batch_size=self.batch_size,
+            num_workers=self.num_workers,
+            sampler_type=SamplerType.DISTRIBUTED if num_replicas > 1 else None,
+            drop_last=False,
+            shuffle=False,
+            persistent_workers=False,
+        )
 
     @torch.no_grad()
     def _evaluate_linear_classifiers(
@@ -645,14 +808,24 @@ class Evaluator:
         }
         metrics = {k: metric.clone() for k in linear_classifiers.classifiers_dict}
 
-        _, results_dict_temp, accumulated_results = evaluate(
-            feature_model,
-            self.data_loader,
-            postprocessors,
-            metrics,
-            get_current_device(),
-            accumulate_results=accumulate_results,
-        )
+        if self.use_cached_embeddings:
+            # Use cached embeddings - directly pass them to evaluate function
+            _, results_dict_temp, accumulated_results = self._evaluate_with_cached_embeddings(
+                linear_classifiers,
+                postprocessors,
+                metrics,
+                accumulate_results=accumulate_results,
+            )
+        else:
+            # Use original evaluation with feature model
+            _, results_dict_temp, accumulated_results = evaluate(
+                feature_model,
+                self.data_loader,
+                postprocessors,
+                metrics,
+                get_current_device(),
+                accumulate_results=accumulate_results,
+            )
 
         logger.info("")
         results_dict = {}
@@ -682,6 +855,53 @@ class Evaluator:
                 f.write("\n")
 
         return results_dict, accumulated_best_results
+
+    def _evaluate_with_cached_embeddings(
+        self,
+        linear_classifiers,
+        postprocessors,
+        metrics,
+        accumulate_results=False,
+    ):
+        """Evaluate using cached embeddings instead of running feature extraction."""
+        device = get_current_device()
+        
+        # Collect all predictions and targets
+        all_predictions = {k: [] for k in postprocessors.keys()}
+        all_targets = {k: [] for k in postprocessors.keys()}
+        
+        for embeddings_batch, targets_batch in self.data_loader:
+            embeddings_batch = to_device(embeddings_batch, device, non_blocking=True)
+            targets_batch = to_device(targets_batch, device, non_blocking=True)
+            
+            # Get classifier outputs
+            classifier_outputs = linear_classifiers(embeddings_batch)
+            
+            # Apply postprocessors and collect results
+            for classifier_name, postprocessor in postprocessors.items():
+                output = postprocessor(classifier_outputs[classifier_name], targets_batch)
+                all_predictions[classifier_name].append(output["preds"])
+                all_targets[classifier_name].append(output["target"])
+        
+        # Concatenate all batches and compute metrics
+        results_dict = {}
+        accumulated_results = {} if accumulate_results else None
+        
+        for classifier_name in postprocessors.keys():
+            preds = torch.cat(all_predictions[classifier_name], dim=0)
+            targets = torch.cat(all_targets[classifier_name], dim=0)
+            
+            # Update metric
+            metrics[classifier_name].update(preds, targets)
+            results_dict[classifier_name] = metrics[classifier_name].compute()
+            
+            if accumulate_results:
+                accumulated_results[classifier_name] = {
+                    "preds": preds,
+                    "target": targets,
+                }
+        
+        return None, results_dict, accumulated_results
 
     def evaluate_and_maybe_save(
         self,
@@ -754,28 +974,43 @@ def make_evaluators(
     metrics_file_path: str,
     training_num_classes: int,
     save_results_func: Optional[Callable],
+    cached_embeddings: Optional[Dict[str, Dict[int, torch.Tensor]]] = None,
 ):
     test_metric_types = eval_config.test_metric_types
     if len(test_metric_types) == 0:
         test_metric_types = (val_metric_type,) * len(eval_config.test_datasets)
     else:
         assert len(test_metric_types) == len(eval_config.test_datasets)
-    val_evaluator, *test_evaluators = [
-        Evaluator(
-            dataset_str=dataset_str,
-            batch_size=eval_config.batch_size,
-            num_workers=eval_config.num_workers,
-            transform_config=transform_config,
-            metric_type=metric_type,
-            metrics_file_path=metrics_file_path,
-            training_num_classes=training_num_classes,
-            save_results_func=save_results_func,
-        )
-        for dataset_str, metric_type in zip(
-            (val_dataset,) + tuple(eval_config.test_datasets),
-            (val_metric_type,) + tuple(test_metric_types),
-        )
-    ]
+    
+    # Determine cache usage
+    use_cached = cached_embeddings is not None
+    
+    evaluator_params = []
+    dataset_strings = (val_dataset,) + tuple(eval_config.test_datasets)
+    metric_types = (val_metric_type,) + tuple(test_metric_types)
+    
+    for dataset_str, metric_type in zip(dataset_strings, metric_types):
+        params = {
+            "dataset_str": dataset_str,
+            "batch_size": eval_config.batch_size,
+            "num_workers": eval_config.num_workers,
+            "transform_config": transform_config,
+            "metric_type": metric_type,
+            "metrics_file_path": metrics_file_path,
+            "training_num_classes": training_num_classes,
+            "save_results_func": save_results_func,
+            "use_cached_embeddings": use_cached,
+        }
+        
+        if use_cached and dataset_str in cached_embeddings:
+            params["cached_embeddings"] = cached_embeddings[dataset_str]
+        
+        evaluator_params.append(params)
+    
+    evaluators = [Evaluator(**params) for params in evaluator_params]
+    val_evaluator = evaluators[0]
+    test_evaluators = evaluators[1:]
+    
     return val_evaluator, test_evaluators
 
 
@@ -841,11 +1076,22 @@ def train_linear_classifiers(
     val_evaluator: Evaluator,
     checkpoint_output_dir: str,
     use_wandb: bool = False,
+    use_cached_embeddings: bool = False,
 ):
     device = get_device()
+    
+    # Setup differs based on whether we're using cached embeddings
+    if use_cached_embeddings:
+        # For cached embeddings, we need to get a sample from the dataset directly
+        sample_embedding = train_dataset[0][0].unsqueeze(0)  # First item is embedding
+        sample_output = sample_embedding  # Already processed
+    else:
+        # Original behavior - extract features from sample
+        sample_output = feature_model(to_device(train_dataset[0][0].unsqueeze(0), device))
+    
     (linear_classifiers, start_iter, max_iter, criterion, optimizer, scheduler, best_accuracy,) = setup_linear_training(
         config=train_config,
-        sample_output=feature_model(to_device(train_dataset[0][0].unsqueeze(0), device)),
+        sample_output=sample_output,
         training_num_classes=training_num_classes,
         checkpoint_output_dir=checkpoint_output_dir,
     )
@@ -881,7 +1127,12 @@ def train_linear_classifiers(
         data = to_device(data, device, non_blocking=True)
         labels = to_device(labels, device, non_blocking=True)
 
-        features = feature_model(data)
+        # Get features - either from cache or feature model
+        if use_cached_embeddings:
+            features = data  # Data is already the embeddings
+        else:
+            features = feature_model(data)
+        
         outputs = linear_classifiers(features)
 
         if len(labels.shape) > 1:
@@ -996,9 +1247,17 @@ def make_train_transform(config: TransformConfig):
     return train_transform
 
 
-def make_train_dataset(train_dataset: str, transform_config: TransformConfig):
-    train_transform = make_train_transform(transform_config)
-    return make_dataset(dataset_str=train_dataset, transform=train_transform)
+def make_train_dataset(train_dataset: str, transform_config: TransformConfig, cached_embeddings: Optional[Dict[int, torch.Tensor]] = None):
+    if cached_embeddings is not None:
+        # Create original dataset to get structure
+        train_transform = make_train_transform(transform_config)
+        original_dataset = make_dataset(dataset_str=train_dataset, transform=train_transform)
+        # Return cached dataset
+        return CachedDataset(original_dataset, cached_embeddings)
+    else:
+        # Original behavior
+        train_transform = make_train_transform(transform_config)
+        return make_dataset(dataset_str=train_dataset, transform=train_transform)
 
 
 def eval_linear_with_model(*, model: torch.nn.Module, autocast_dtype, config: LinearAffordanceEvalConfig):
@@ -1064,6 +1323,9 @@ def eval_linear_with_model(*, model: torch.nn.Module, autocast_dtype, config: Li
                 "few_shot_k_or_percent": config.few_shot.k_or_percent,
                 "few_shot_n_tries": config.few_shot.n_tries,
                 
+                # Caching configuration
+                "cache_embeddings": config.cache_embeddings,
+                
                 # System information
                 "device": str(device),
                 "num_gpus": torch.cuda.device_count() if torch.cuda.is_available() else 0,
@@ -1076,16 +1338,91 @@ def eval_linear_with_model(*, model: torch.nn.Module, autocast_dtype, config: Li
     if device.type == "cuda":
         cudnn.benchmark = True
 
-    train_dataset = make_train_dataset(config.train.dataset, config.transform)
+    # Initialize embeddings cache
+    cached_embeddings = {}
+    use_cached_embeddings = config.cache_embeddings
+    
+    # Generate cache keys for all datasets
+    cache_keys = {}
+    dataset_strings = [config.train.dataset, config.train.val_dataset] + list(config.eval.test_datasets)
+    for dataset_str in dataset_strings:
+        cache_key = get_cache_key(dataset_str, config.model, config.transform)
+        cache_keys[dataset_str] = cache_key
+    
+    if use_cached_embeddings:
+        logger.info("Checking for cached embeddings...")
+        
+        # Check if all required caches exist
+        all_caches_exist = True
+        for dataset_str in dataset_strings:
+            cache_key = cache_keys[dataset_str]
+            split_name = "train" if "TRAIN" in dataset_str.upper() else ("val" if "VAL" in dataset_str.upper() else "test")
+            cache_path = get_cache_path(config.output_dir, cache_key, split_name)
+            
+            embeddings = load_embeddings_from_cache(cache_path)
+            if embeddings is not None:
+                cached_embeddings[dataset_str] = embeddings
+                logger.info(f"Loaded cached embeddings for {dataset_str}")
+            else:
+                all_caches_exist = False
+                logger.info(f"No cached embeddings found for {dataset_str}")
+        
+        if not all_caches_exist:
+            logger.info("Not all caches available. Generating embeddings...")
+            use_cached_embeddings = False
+            cached_embeddings = {}
+
+    # Create datasets and extract embeddings if needed
+    if not use_cached_embeddings:
+        # Create the feature model for embedding extraction
+        n_last_blocks = max(config.train.n_last_blocks_list)
+        
+        # Set up autocast context based on device type
+        if device.type == "cuda":
+            autocast_ctx = partial(torch.autocast, device_type="cuda", enabled=True, dtype=autocast_dtype)
+        else:
+            # For CPU, we can use autocast but it's less critical
+            autocast_ctx = partial(torch.autocast, device_type="cpu", enabled=True)
+        
+        feature_model = ModelWithIntermediateLayers(model, n_last_blocks, autocast_ctx)
+        
+        # Extract embeddings for all datasets
+        for dataset_str in dataset_strings:
+            cache_key = cache_keys[dataset_str]
+            split_name = "train" if "TRAIN" in dataset_str.upper() else ("val" if "VAL" in dataset_str.upper() else "test")
+            cache_path = get_cache_path(config.output_dir, cache_key, split_name)
+            
+            # Create data loader for embedding extraction
+            data_loader, _ = make_eval_data_loader(
+                test_dataset_str=dataset_str,
+                transform_config=config.transform,
+                batch_size=config.eval.batch_size,
+                num_workers=config.eval.num_workers,
+                metric_type=config.train.val_metric_type,
+                use_enumerated_targets=True,
+            )
+            
+            # Extract and cache embeddings
+            embeddings = extract_and_cache_embeddings(feature_model, data_loader, cache_path, device)
+            cached_embeddings[dataset_str] = embeddings
+        
+        use_cached_embeddings = True
+        logger.info("All embeddings extracted and cached.")
+
+    # Create datasets using cached embeddings
+    train_dataset = make_train_dataset(config.train.dataset, config.transform, 
+                                     cached_embeddings.get(config.train.dataset))
     training_num_classes = get_num_classes(train_dataset)
     logger.info(f"AffordanceADE dataset has {training_num_classes} classes")
     logger.info(f"Using device: {device}")
+    logger.info(f"Using cached embeddings: {use_cached_embeddings}")
     
     # Log dataset information to wandb
     if use_wandb:
         wandb.log({
             "dataset/num_classes": training_num_classes,
             "dataset/train_size": len(train_dataset),
+            "dataset/using_cached_embeddings": use_cached_embeddings,
         })
     
     train_dataset_dict = create_train_dataset_dict(
@@ -1094,6 +1431,8 @@ def eval_linear_with_model(*, model: torch.nn.Module, autocast_dtype, config: Li
         few_shot_k_or_percent=config.few_shot.k_or_percent,
         few_shot_n_tries=config.few_shot.n_tries,
     )
+    
+    # Create feature model (may not be used if cached)
     n_last_blocks = max(config.train.n_last_blocks_list)
     
     # Set up autocast context based on device type
@@ -1118,7 +1457,9 @@ def eval_linear_with_model(*, model: torch.nn.Module, autocast_dtype, config: Li
         metrics_file_path=metrics_file_path,
         training_num_classes=training_num_classes,
         save_results_func=save_results_func,
+        cached_embeddings=cached_embeddings if use_cached_embeddings else None,
     )
+    
     results_dict = {}
     checkpoint_output_dirs: list = []
     for _try in train_dataset_dict.keys():
@@ -1138,6 +1479,7 @@ def eval_linear_with_model(*, model: torch.nn.Module, autocast_dtype, config: Li
             val_evaluator=val_evaluator,
             checkpoint_output_dir=checkpoint_output_dir,
             use_wandb=use_wandb,
+            use_cached_embeddings=use_cached_embeddings,
         )
         checkpoint_output_dirs.append(checkpoint_output_dir)
         results_dict[_try] = val_evaluator.evaluate_and_maybe_save(
@@ -1187,6 +1529,7 @@ def eval_linear_with_model(*, model: torch.nn.Module, autocast_dtype, config: Li
             "best_classifier_name": results_dict.get("best_classifier", "unknown"),
             "total_training_time_seconds": int(time.time() - start),
             "training_iterations": iteration,
+            "used_cached_embeddings": use_cached_embeddings,
         })
         
         logger.info(f"Wandb run completed: {wandb.run.url}")
