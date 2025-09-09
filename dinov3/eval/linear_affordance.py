@@ -400,12 +400,24 @@ def extract_and_cache_embeddings(
             indices, targets = targets_and_indices
             data = to_device(data, device, non_blocking=True)
             
-            # Extract features
+            # Extract features - this returns a list of (patch_tokens, class_token) tuples
             features = feature_model(data)
             
             # Store embeddings with their indices
+            # features is a list of tuples for each intermediate layer
+            # We need to extract the features for each sample in the batch
+            batch_size = data.shape[0]
             for i, idx in enumerate(indices):
-                embeddings_dict[idx.item()] = features[i].cpu()
+                # Extract features for sample i across all intermediate layers
+                sample_features = []
+                for layer_features in features:
+                    patch_tokens, class_token = layer_features
+                    # Extract the i-th sample from the batch
+                    sample_patch_tokens = patch_tokens[i].cpu()
+                    sample_class_token = class_token[i].cpu()
+                    sample_features.append((sample_patch_tokens, sample_class_token))
+                
+                embeddings_dict[idx.item()] = sample_features
     
     # Save to cache
     save_embeddings_to_cache(embeddings_dict, cache_path)
@@ -415,7 +427,7 @@ def extract_and_cache_embeddings(
 class CachedDataset(torch.utils.data.Dataset):
     """Dataset wrapper that uses cached embeddings instead of running feature extraction."""
     
-    def __init__(self, original_dataset, embeddings_dict: Dict[int, torch.Tensor]):
+    def __init__(self, original_dataset, embeddings_dict: Dict[int, list]):
         self.original_dataset = original_dataset
         self.embeddings_dict = embeddings_dict
         
@@ -426,13 +438,50 @@ class CachedDataset(torch.utils.data.Dataset):
         # Get the original item (for target/label)
         _, target = self.original_dataset[idx]
         
-        # Get cached embedding
+        # Get cached embedding - this is a list of (patch_tokens, class_token) tuples
         if idx in self.embeddings_dict:
             embedding = self.embeddings_dict[idx]
         else:
             raise KeyError(f"Embedding for index {idx} not found in cache")
             
         return embedding, target
+
+
+def cached_embeddings_collate_fn(batch):
+    """
+    Custom collate function for cached embeddings.
+    
+    Input: List of (cached_features, target) where cached_features is a list of 
+           (patch_tokens, class_token) tuples for each intermediate layer.
+    Output: (batched_features, batched_targets) where batched_features has the same
+            structure as the original feature model output.
+    """
+    embeddings, targets = zip(*batch)
+    
+    # Stack targets
+    targets = torch.stack(targets)
+    
+    # Batch the embeddings - recreate the intermediate layer structure
+    n_layers = len(embeddings[0])  # Number of intermediate layers
+    batched_features = []
+    
+    for layer_idx in range(n_layers):
+        # Collect patch tokens and class tokens for this layer across the batch
+        layer_patch_tokens = []
+        layer_class_tokens = []
+        
+        for sample_embedding in embeddings:
+            patch_tokens, class_token = sample_embedding[layer_idx]
+            layer_patch_tokens.append(patch_tokens)
+            layer_class_tokens.append(class_token)
+        
+        # Stack to create batch dimension
+        batched_patch_tokens = torch.stack(layer_patch_tokens)
+        batched_class_tokens = torch.stack(layer_class_tokens)
+        
+        batched_features.append((batched_patch_tokens, batched_class_tokens))
+    
+    return batched_features, targets
 
 import dinov3.distributed as distributed
 from dinov3.checkpointer import (
@@ -741,7 +790,7 @@ class Evaluator:
     training_num_classes: int
     save_results_func: Optional[Callable]
     use_cached_embeddings: bool = False
-    cached_embeddings: Optional[Dict[int, torch.Tensor]] = None
+    cached_embeddings: Optional[Dict[int, list]] = None
 
     def __post_init__(self):
         # Only create data loader if not using cached embeddings
@@ -788,6 +837,7 @@ class Evaluator:
             drop_last=False,
             shuffle=False,
             persistent_workers=False,
+            collate_fn=cached_embeddings_collate_fn,
         )
 
     @torch.no_grad()
@@ -976,7 +1026,7 @@ def make_evaluators(
     metrics_file_path: str,
     training_num_classes: int,
     save_results_func: Optional[Callable],
-    cached_embeddings: Optional[Dict[str, Dict[int, torch.Tensor]]] = None,
+    cached_embeddings: Optional[Dict[str, Dict[int, list]]] = None,
 ):
     test_metric_types = eval_config.test_metric_types
     if len(test_metric_types) == 0:
@@ -1085,7 +1135,7 @@ def train_linear_classifiers(
     # Setup differs based on whether we're using cached embeddings
     if use_cached_embeddings:
         # For cached embeddings, we need to get a sample from the dataset directly
-        sample_embedding = train_dataset[0][0].unsqueeze(0)  # First item is embedding
+        sample_embedding = train_dataset[0][0]  # First item is embedding (list of tuples)
         sample_output = sample_embedding  # Already processed
     else:
         # Original behavior - extract features from sample
@@ -1101,6 +1151,10 @@ def train_linear_classifiers(
     eval_period = train_config.eval_period_iterations or train_config.epoch_length
 
     sampler_type = SamplerType.INFINITE
+    
+    # Use custom collate function for cached embeddings
+    collate_fn = cached_embeddings_collate_fn if use_cached_embeddings else None
+    
     train_data_loader = make_data_loader(
         dataset=train_dataset,
         batch_size=train_config.batch_size,
@@ -1111,6 +1165,7 @@ def train_linear_classifiers(
         sampler_advance=start_iter,
         drop_last=True,
         persistent_workers=True,
+        collate_fn=collate_fn,
     )
 
     iteration = start_iter
@@ -1249,7 +1304,7 @@ def make_train_transform(config: TransformConfig):
     return train_transform
 
 
-def make_train_dataset(train_dataset: str, transform_config: TransformConfig, cached_embeddings: Optional[Dict[int, torch.Tensor]] = None):
+def make_train_dataset(train_dataset: str, transform_config: TransformConfig, cached_embeddings: Optional[Dict[int, list]] = None):
     if cached_embeddings is not None:
         # Create original dataset to get structure
         train_transform = make_train_transform(transform_config)
