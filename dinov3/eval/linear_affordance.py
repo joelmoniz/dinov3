@@ -392,10 +392,12 @@ def extract_and_cache_embeddings(
     feature_model.eval()
     
     with torch.no_grad():
-        for batch_idx, (data, targets, indices) in enumerate(data_loader):
+        for batch_idx, (data, targets_and_indices) in enumerate(data_loader):
             if batch_idx % 100 == 0:
                 logger.info(f"Processing batch {batch_idx}/{len(data_loader)}")
             
+            # Unpack the targets and indices from the tuple
+            indices, targets = targets_and_indices
             data = to_device(data, device, non_blocking=True)
             
             # Extract features
@@ -713,7 +715,7 @@ def make_eval_data_loader(
     if use_enumerated_targets:
         dataset_with_enum = DatasetWithEnumeratedTargets(test_dataset, pad_dataset=True, num_replicas=num_replicas)
     else:
-        dataset_with_enum = DatasetWithEnumeratedTargets(test_dataset, pad_dataset=True, num_replicas=num_replicas)
+        dataset_with_enum = test_dataset
     
     test_data_loader = make_data_loader(
         dataset=dataset_with_enum,
