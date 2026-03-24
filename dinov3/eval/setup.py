@@ -4,6 +4,7 @@
 # the terms of the DINOv3 License Agreement.
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Tuple, TypedDict
 
 import torch
@@ -47,9 +48,13 @@ def load_model_and_context(model_config: ModelConfig, output_dir: str) -> tuple[
                 raise ValueError
             model = torch.hub.load(f"facebookresearch/{repo}", model_config.dino_hub)
         else:
-            # get current file path
-            dino_repo_path = __file__.split("dinov3")[0] + "dinov3"
-            model = torch.hub.load(dino_repo_path, model_config.dino_hub, source='local', weights=model_config.pretrained_weights)
+            dino_repo_path = Path(__file__).resolve().parents[2]
+            model = torch.hub.load(
+                str(dino_repo_path),
+                model_config.dino_hub,
+                source="local",
+                weights=model_config.pretrained_weights,
+            )
         base_model_context = BaseModelContext(autocast_dtype=torch.float)
     else:
         model, base_model_context = setup_and_build_model(
